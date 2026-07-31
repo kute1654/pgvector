@@ -4,6 +4,7 @@
 
 #include "access/genam.h"
 #include "access/generic_xlog.h"
+#include "access/relscan.h"
 #include "common/hashfn.h"
 #include "fmgr.h"
 #include "hnsw.h"
@@ -726,6 +727,29 @@ CountElement(HnswElement skipElement, HnswElement e)
 }
 
 /*
+ * Check whether any heap TID for an element satisfies executor scalar quals.
+ * Exploration still uses all elements; this only filters the result heap W.
+ */
+static bool
+ElementMatchesTidFilter(IndexScanDesc scan, HnswElement element)
+{
+#if PG_VERSION_NUM >= 180000
+	if (!hnsw_in_traversal_filter || scan == NULL || scan->xs_tid_filter == NULL)
+		return true;
+
+	for (int i = 0; i < element->heaptidsLength; i++)
+	{
+		if (scan->xs_tid_filter(scan, &element->heaptids[i], scan->xs_tid_filter_state))
+			return true;
+	}
+
+	return false;
+#else
+	return true;
+#endif
+}
+
+/*
  * Load unvisited neighbors from memory
  */
 static void
@@ -820,7 +844,7 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
  * Algorithm 2 from paper
  */
 List *
-HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
+HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, IndexScanDesc filterScan)
 {
 	List	   *w = NIL;
 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
@@ -834,6 +858,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	HnswUnvisited *unvisited = palloc_array_checked(HnswUnvisited, lm);
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
+	bool		filtering = hnsw_in_traversal_filter && filterScan != NULL && filterScan->xs_tid_filter != NULL && lc == 0 && !inserting;
 
 	if (v == NULL)
 	{
@@ -856,7 +881,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		localNeighborhood = palloc(neighborhoodSize);
 	}
 
-	/* Add entry points to v, C, and W */
+	/* Add entry points to v and C. Only matching elements are added to W. */
 	foreach(lc2, ep)
 	{
 		HnswSearchCandidate *sc = (HnswSearchCandidate *) lfirst(lc2);
@@ -872,25 +897,34 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		}
 
 		pairingheap_add(C, &sc->c_node);
-		pairingheap_add(W, &sc->w_node);
 
 		/*
 		 * Do not count elements being deleted towards ef when vacuuming. It
 		 * would be ideal to do this for inserts as well, but this could
 		 * affect insert performance.
 		 */
-		if (CountElement(skipElement, HnswPtrAccess(base, sc->element)))
-			wlen++;
+		if (ElementMatchesTidFilter(filterScan, HnswPtrAccess(base, sc->element)))
+		{
+			pairingheap_add(W, &sc->w_node);
+
+			if (CountElement(skipElement, HnswPtrAccess(base, sc->element)))
+				wlen++;
+		}
 	}
 
 	while (!pairingheap_is_empty(C))
 	{
 		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
-		HnswSearchCandidate *f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+		HnswSearchCandidate *f = NULL;
 		HnswElement cElement;
 
-		if (c->distance > f->distance)
-			break;
+		if (wlen >= ef && !pairingheap_is_empty(W))
+		{
+			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+
+			if (c->distance > f->distance)
+				break;
+		}
 
 		cElement = HnswPtrAccess(base, c->element);
 
@@ -909,8 +943,11 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			HnswSearchCandidate *e;
 			double		eDistance;
 			bool		alwaysAdd = wlen < ef;
+			bool		addToSearch;
+			bool		addToResults;
 
-			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+			if (!pairingheap_is_empty(W))
+				f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 
 			if (inMemory)
 			{
@@ -925,13 +962,15 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 				/* Avoid any allocations if not adding */
 				eElement = NULL;
-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
+				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, filtering || alwaysAdd || discarded != NULL || f == NULL ? NULL : &f->distance, &eElement);
 
 				if (eElement == NULL)
 					continue;
 			}
 
-			if (!(eDistance < f->distance || alwaysAdd))
+			addToSearch = alwaysAdd || f == NULL || eDistance < f->distance;
+
+			if (!addToSearch)
 			{
 				if (discarded != NULL)
 				{
@@ -950,14 +989,17 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			/* Create a new candidate */
 			e = HnswInitSearchCandidate(base, eElement, eDistance);
 			pairingheap_add(C, &e->c_node);
-			pairingheap_add(W, &e->w_node);
+
+			addToResults = ElementMatchesTidFilter(filterScan, eElement);
+			if (addToResults)
+				pairingheap_add(W, &e->w_node);
 
 			/*
 			 * Do not count elements being deleted towards ef when vacuuming.
 			 * It would be ideal to do this for inserts as well, but this
 			 * could affect insert performance.
 			 */
-			if (CountElement(skipElement, eElement))
+			if (addToResults && CountElement(skipElement, eElement))
 			{
 				wlen++;
 
@@ -1303,7 +1345,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	/* 1st phase: greedy search to insert level */
 	for (int lc = entryLevel; lc >= level + 1; lc--)
 	{
-		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
+		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL);
 		ep = w;
 	}
 
@@ -1322,7 +1364,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 		List	   *lw = NIL;
 		ListCell   *lc2;
 
-		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
+		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL);
 
 		/* Convert search candidates to candidates */
 		foreach(lc2, w)

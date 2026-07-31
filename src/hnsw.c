@@ -36,6 +36,7 @@ int			hnsw_ef_search;
 int			hnsw_iterative_scan;
 int			hnsw_max_scan_tuples;
 double		hnsw_scan_mem_multiplier;
+bool		hnsw_in_traversal_filter;
 int			hnsw_lock_tranche_id;
 static relopt_kind hnsw_relopt_kind;
 
@@ -107,6 +108,11 @@ HnswInit(void)
 	DefineCustomRealVariable("hnsw.scan_mem_multiplier", "Sets the multiple of work_mem to use for iterative scans",
 							 NULL, &hnsw_scan_mem_multiplier,
 							 1, 1, 1000, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("hnsw.in_traversal_filter", "Enables experimental HNSW filtering during vector graph search",
+							 NULL,
+							 &hnsw_in_traversal_filter,
+							 false, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("hnsw");
 }
