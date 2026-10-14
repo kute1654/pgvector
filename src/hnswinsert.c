@@ -10,6 +10,7 @@
 #include "utils/datum.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "veccache.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -792,6 +793,9 @@ hnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 
 	/* Insert tuple */
 	HnswInsertTuple(index, values, isnull, heap_tid);
+
+	/* The index content changed; invalidate any cached answers for this index. */
+	VecCacheBumpWriteGen(index);
 
 	/* Delete memory context */
 	MemoryContextSwitchTo(oldCtx);

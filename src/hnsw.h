@@ -151,6 +151,14 @@ typedef Pointer Item;
 #define HnswPtrPointer(hp) (hp).ptr
 #define HnswPtrOffset(hp) relptr_offset((hp).relptr)
 
+/* Type-specific normalize functions (defined in hnswutils.c).  The plain
+ * `vector` opclass normalizer is l2_normalize(); used to gate which index
+ * types the result cache may serve (halfvec/sparsevec/bit have different
+ * Datum layouts and must not go through the Vector byte hash). */
+extern Datum l2_normalize(PG_FUNCTION_ARGS);
+extern Datum halfvec_l2_normalize(PG_FUNCTION_ARGS);
+extern Datum sparsevec_l2_normalize(PG_FUNCTION_ARGS);
+
 /* Variables */
 extern int	hnsw_ef_search;
 extern int	hnsw_iterative_scan;
@@ -301,6 +309,9 @@ typedef struct HnswSupport
 	FmgrInfo   *procinfo;
 	FmgrInfo   *normprocinfo;
 	Oid			collation;
+	/* Profiling counters - reset before each scan */
+	int64		distance_calls;
+	double		distance_time_total_ms; /* accumulated ms in distance function */
 }			HnswSupport;
 
 typedef struct HnswQuery
@@ -360,6 +371,20 @@ typedef struct HnswMetaPageData
 }			HnswMetaPageData;
 
 typedef HnswMetaPageData * HnswMetaPage;
+
+#define HNSW_META_CACHE_MAGIC 0x9ACE5AC4
+
+typedef struct HnswMetaCacheData
+{
+	uint32		magicNumber;	/* HNSW_META_CACHE_MAGIC */
+	uint32		dimensions;
+	uint16		m;
+	uint16		efConstruction;
+	BlockNumber entryBlkno;		/* cached global entry point block */
+	OffsetNumber entryOffno;	/* cached global entry point offset */
+	int16		entryLevel;		/* cached global entry point level */
+	BlockNumber insertPage;
+}			HnswMetaCacheData;
 
 typedef struct HnswPageOpaqueData
 {
@@ -465,7 +490,8 @@ void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
 HnswElement HnswGetEntryPoint(Relation index);
-void		HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entryPoint);
+void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
+void		HnswGetMetaPageInfoCached(Relation index, int *m, HnswElement * entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
 HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
 HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
