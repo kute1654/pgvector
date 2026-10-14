@@ -60,6 +60,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "veccache.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -1156,6 +1157,9 @@ hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	result = palloc_object(IndexBuildResult);
 	result->heap_tuples = buildstate.reltuples;
 	result->index_tuples = buildstate.indtuples;
+
+	/* Establish a non-zero write generation for this freshly built index. */
+	VecCacheBumpWriteGen(index);
 
 	return result;
 }

@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include <limits.h>
+#include <sys/time.h>
 
 #include "access/genam.h"
 #include "access/relscan.h"
@@ -14,6 +15,7 @@
 #include "utils/memutils.h"
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
+#include "veccache.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -35,8 +37,8 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	char	   *base = NULL;
 	HnswQuery  *q = &so->q;
 
-	/* Get m and entry point */
-	HnswGetMetaPageInfo(index, &m, &entryPoint);
+	/* Step 1: Get m and entry point (meta page read) */
+	HnswGetMetaPageInfoCached(index, &m, &entryPoint);
 
 	q->value = value;
 	so->m = m;
@@ -52,7 +54,9 @@ GetScanItems(IndexScanDesc scan, Datum value)
 		ep = w;
 	}
 
-	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, scan);
+	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v,
+							hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL,
+							true, &so->tuples, scan);
 }
 
 /*
@@ -218,6 +222,10 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		if (!IsMVCCSnapshot(scan->xs_snapshot))
 			elog(ERROR, "non-MVCC snapshots are not supported with hnsw");
 
+		// VecCacheLog("SCAN-START rel=" UINT64_FORMAT " orderBys=%d iterative=%d ef=%d",
+		// 			(uint64) scan->indexRelation->rd_locator.relNumber,
+		// 			scan->numberOfOrderBys, (int) hnsw_iterative_scan, hnsw_ef_search);
+
 		/* Get scan value */
 		value = GetScanValue(scan);
 
@@ -227,7 +235,59 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		 */
 		LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
-		so->w = GetScanItems(scan, value);
+		/*
+		 * Layer-2 query result cache.  If the same normalized query vector has
+		 * already been answered for this index and the index has not been written
+		 * since, replay the stored candidate list and skip the entire HNSW
+		 * search.  Limited to non-iterative scans, where the exact replay of the
+		 * candidate list is well-defined.
+		 *
+		 * Only plain `vector` indexes are cached: the cache reads the query
+		 * datum as a Vector (see DatumGetVector below); halfvec / sparsevec /
+		 * bit use different in-memory layouts and would be misinterpreted
+		 * (crash or garbage keys).  The normalize function pointer identifies
+		 * the opclass input type (vector -> l2_normalize).
+		 *
+		 * Scans filtered by hnsw.in_traversal_filter are also excluded: the
+		 * cache replay returns the unfiltered candidate set regardless of the
+		 * caller's scalar quals, which would be wrong for filtered scans
+		 * (PG 18/19 emit heap-TID filters into HNSW itself).
+		 */
+		if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_OFF &&
+			scan->numberOfOrderBys > 0 &&
+			!hnsw_in_traversal_filter &&
+			so->typeInfo->normalize == l2_normalize &&
+			!(scan->orderByData->sk_flags & SK_ISNULL))
+		{
+			Vector	   *q = DatumGetVector(value);
+			Oid			uproc = scan->orderByData->sk_func.fn_oid;
+
+			// VecCacheLog("SCAN rel=" UINT64_FORMAT " dim=%d ef=%d uproc=%u q0=%g q1=%g q2=%g",
+			// 			(uint64) scan->indexRelation->rd_locator.relNumber,
+			// 			(int) q->dim, hnsw_ef_search, uproc, q->x[0], q->x[1], q->x[2]);
+
+			if (!VecCacheLookup(scan->indexRelation, q, hnsw_ef_search, uproc, &so->w))
+			{
+				// struct timeval tv0;
+				// struct timeval tv1;
+				// unsigned long long gsi_us;
+
+				// gettimeofday(&tv0, NULL);
+				so->w = GetScanItems(scan, value);
+				// gettimeofday(&tv1, NULL);
+				// gsi_us = (unsigned long long) ((tv1.tv_sec - tv0.tv_sec) * 1000000LL + (tv1.tv_usec - tv0.tv_usec));
+
+				// VecCacheLog("SCAN-MISS rel=" UINT64_FORMAT " GetScanItems_us=%llu",
+				// 	(uint64) scan->indexRelation->rd_locator.relNumber, gsi_us);
+				VecCacheStore(scan->indexRelation, q, hnsw_ef_search, uproc, so->w);
+			}
+			// else
+			// 	VecCacheLog("SCAN-HIT rel=" UINT64_FORMAT " nrows=%d",
+			// 				(uint64) scan->indexRelation->rd_locator.relNumber,
+			// 				list_length(so->w));
+		}
+		else
+			so->w = GetScanItems(scan, value);
 
 		/* Release shared lock */
 		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);

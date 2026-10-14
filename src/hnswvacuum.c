@@ -9,6 +9,7 @@
 #include "storage/lmgr.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "veccache.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -792,6 +793,9 @@ hnswbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	HnswBench("MarkDeleted", MarkDeleted(&vacuumstate));
 
 	FreeVacuumState(&vacuumstate);
+
+	/* The index content changed; invalidate any cached answers for this index. */
+	VecCacheBumpWriteGen(info->index);
 
 	return vacuumstate.stats;
 }

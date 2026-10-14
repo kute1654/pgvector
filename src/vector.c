@@ -1,10 +1,14 @@
 #include "postgres.h"
 
 #include <math.h>
+#include <sys/time.h>
+#include <execinfo.h>
 
 #include "bitutils.h"
 #include "bitvec.h"
 #include "catalog/pg_type.h"
+#include "fast_float.h"
+#include "float_parse.h"
 #include "common/shortest_dec.h"
 #include "fmgr.h"
 #include "halfutils.h"
@@ -15,11 +19,16 @@
 #include "libpq/pqformat.h"
 #include "port.h"				/* for strtof() */
 #include "sparsevec.h"
+#include "miscadmin.h"		/* for debug_query_string, CurrentMemoryContext */
 #include "utils/array.h"
 #include "utils/float.h"
 #include "utils/fmgrprotos.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/numeric.h"
 #include "utils/varbit.h"
+#include "veccache.h"
 #include "vector.h"
 
 #if PG_VERSION_NUM >= 160000
@@ -62,6 +71,18 @@ _PG_init(void)
 	HalfvecInit();
 	HnswInit();
 	IvfflatInit();
+	VecCacheInit();
+
+	DefineCustomEnumVariable(
+		"vector.in_parse_mode",
+		"Sets the decimal-to-float parser used for vector text input.",
+		NULL,
+		&float_parse_mode,
+		FLOAT_PARSE_STRTOF,
+		float_parse_mode_options,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
 }
 
 /*
@@ -172,17 +193,22 @@ CheckStateArray(ArrayType *statearray, const char *caller)
 
 /*
  * Convert textual representation to internal representation
+ *
+ * Runtime parser selection (GUC "vector.in_parse_mode"):
+ *   inline / fast_float / strtof
  */
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(vector_in);
 Datum
 vector_in(PG_FUNCTION_ARGS)
 {
+	// struct timeval tv_s, tv_e;
+	// gettimeofday(&tv_s, NULL);
+
 	char	   *lit = PG_GETARG_CSTRING(0);
 	int32		typmod = PG_GETARG_INT32(2);
-	float		x[VECTOR_MAX_DIM];
-	int			dim = 0;
 	char	   *pt = lit;
 	Vector	   *result;
+	int			dim;
 
 	while (vector_isspace(*pt))
 		pt++;
@@ -203,61 +229,69 @@ vector_in(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("vector must have at least 1 dimension")));
 
-	for (;;)
+	/* ================ Approach: heap pre-scan (no stack buffer) ================ */
 	{
-		float		val;
-		char	   *stringEnd;
-
-		if (dim == VECTOR_MAX_DIM)
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("vector cannot have more than %d dimensions", VECTOR_MAX_DIM)));
-
-		while (vector_isspace(*pt))
-			pt++;
-
-		/* Check for empty string like float4in */
-		if (*pt == '\0')
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("invalid input syntax for type vector: \"%s\"", lit)));
-
-		errno = 0;
-
-		/* Use strtof like float4in to avoid a double-rounding problem */
-		/* Postgres sets LC_NUMERIC to C on startup */
-		val = strtof(pt, &stringEnd);
-
-		if (stringEnd == pt)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("invalid input syntax for type vector: \"%s\"", lit)));
-
-		/* Check for range error like float4in */
-		if (errno == ERANGE && isinf(val))
-			ereport(ERROR,
-					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-					 errmsg("\"%s\" is out of range for type vector", pnstrdup(pt, stringEnd - pt))));
-
-		CheckElement(val);
-		x[dim++] = val;
-
-		pt = stringEnd;
-
-		while (vector_isspace(*pt))
-			pt++;
-
-		if (*pt == ',')
-			pt++;
-		else if (*pt == ']')
+		/* Pre-scan dimension count */
+		dim = 1;
 		{
-			pt++;
-			break;
+			char	   *cnt = pt;
+
+			while (*cnt != ']')
+			{
+				if (*cnt == '\0')
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+							 errmsg("invalid input syntax for type vector: \"%s\"", lit)));
+				if (*cnt == ',')
+					dim++;
+				cnt++;
+			}
 		}
-		else
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("invalid input syntax for type vector: \"%s\"", lit)));
+
+		CheckDim(dim);
+		CheckExpectedDim(typmod, dim);
+		result = InitVector(dim);
+
+		for (int i = 0; i < dim; i++)
+		{
+			float		val;
+
+			while (vector_isspace(*pt))
+				pt++;
+
+			if (*pt == '\0')
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("invalid input syntax for type vector: \"%s\"", lit)));
+
+			/* --- parse one value --- */
+			pt = float_parse_float(float_parse_mode, pt, &val, lit, "vector");
+
+			CheckElement(val);
+			result->x[i] = val;
+
+			while (vector_isspace(*pt))
+				pt++;
+
+			if (i < dim - 1)
+			{
+				if (*pt == ',')
+					pt++;
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+							 errmsg("invalid input syntax for type vector: \"%s\"", lit)));
+			}
+			else
+			{
+				if (*pt == ']')
+					pt++;
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+							 errmsg("invalid input syntax for type vector: \"%s\"", lit)));
+			}
+		}
 	}
 
 	/* Only whitespace is allowed after the closing brace */
@@ -270,12 +304,11 @@ vector_in(PG_FUNCTION_ARGS)
 				 errmsg("invalid input syntax for type vector: \"%s\"", lit),
 				 errdetail("Junk after closing right brace.")));
 
-	CheckDim(dim);
-	CheckExpectedDim(typmod, dim);
+	// gettimeofday(&tv_e, NULL);
+	// double total_ms = (tv_e.tv_sec - tv_s.tv_sec) * 1000.0 + (tv_e.tv_usec - tv_s.tv_usec) / 1000.0;
 
-	result = InitVector(dim);
-	for (int i = 0; i < dim; i++)
-		result->x[i] = x[i];
+	// elog(LOG, "[PGVECTOR_TIMING] vector_in mode=%s dim=%d len=%zu ms=%.4f ctx=%s",
+	// 	 float_parse_mode_str(float_parse_mode), dim, strlen(lit), total_ms, CurrentMemoryContext->name);
 
 	PG_RETURN_POINTER(result);
 }
@@ -444,6 +477,9 @@ FUNCTION_PREFIX PG_FUNCTION_INFO_V1(array_to_vector);
 Datum
 array_to_vector(PG_FUNCTION_ARGS)
 {
+	// struct timeval _atv_s, _atv_e;
+	// gettimeofday(&_atv_s, NULL);
+
 	ArrayType  *array = PG_GETARG_ARRAYTYPE_P(0);
 	int32		typmod = PG_GETARG_INT32(1);
 	Vector	   *result;
@@ -507,6 +543,12 @@ array_to_vector(PG_FUNCTION_ARGS)
 	/* Check elements */
 	for (int i = 0; i < result->dim; i++)
 		CheckElement(result->x[i]);
+
+	// gettimeofday(&_atv_e, NULL);
+	// double _atv_ms = (_atv_e.tv_sec - _atv_s.tv_sec) * 1000.0 + (_atv_e.tv_usec - _atv_s.tv_usec) / 1000.0;
+	// Oid _atv_eletype = ARR_ELEMTYPE(array);
+	// elog(LOG, "[PGVECTOR_TIMING] array_to_vector eletype=%u dim=%d n=%d ms=%.4f",
+	// 	 _atv_eletype, result->dim, nelemsp, _atv_ms);
 
 	PG_RETURN_POINTER(result);
 }
