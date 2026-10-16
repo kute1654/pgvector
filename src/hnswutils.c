@@ -1,7 +1,6 @@
 #include "postgres.h"
 
 #include <math.h>
-#include <sys/time.h>
 
 #include "access/genam.h"
 #include "access/generic_xlog.h"
@@ -18,7 +17,6 @@
 #include "utils/memdebug.h"
 #include "utils/rel.h"
 #include "vector.h"
-#include "utils/memutils.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -158,8 +156,6 @@ HnswInitSupport(HnswSupport * support, Relation index)
 	support->procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
 	support->collation = index->rd_indcollation[0];
 	support->normprocinfo = HnswOptionalProcInfo(index, HNSW_NORM_PROC);
-	support->distance_calls = 0;
-	support->distance_time_total_ms = 0.0;
 }
 
 /*
@@ -330,54 +326,6 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 	}
 
 	UnlockReleaseBuffer(buf);
-}
-
-void
-HnswGetMetaPageInfoCached(Relation index, int *m, HnswElement * entryPoint)
-{
-	HnswMetaCacheData *cached = index->rd_amcache;
-
-	if (cached == NULL || cached->magicNumber != HNSW_META_CACHE_MAGIC)
-	{
-		Buffer		buf;
-		Page		page;
-		HnswMetaPage metap;
-
-		buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		metap = HnswPageGetMeta(page);
-
-		if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
-			elog(ERROR, "hnsw index is not valid");
-
-		cached = MemoryContextAlloc(CacheMemoryContext, sizeof(HnswMetaCacheData));
-		cached->magicNumber = HNSW_META_CACHE_MAGIC;
-		cached->dimensions = metap->dimensions;
-		cached->m = metap->m;
-		cached->efConstruction = metap->efConstruction;
-		cached->entryBlkno = metap->entryBlkno;
-		cached->entryOffno = metap->entryOffno;
-		cached->entryLevel = metap->entryLevel;
-		cached->insertPage = metap->insertPage;
-
-		index->rd_amcache = cached;
-		UnlockReleaseBuffer(buf);
-	}
-
-	if (m != NULL)
-		*m = cached->m;
-
-	if (entryPoint != NULL)
-	{
-		if (BlockNumberIsValid(cached->entryBlkno))
-		{
-			*entryPoint = HnswInitElementFromBlock(cached->entryBlkno, cached->entryOffno);
-			(*entryPoint)->level = cached->entryLevel;
-		}
-		else
-			*entryPoint = NULL;
-	}
 }
 
 /*
@@ -785,7 +733,7 @@ CountElement(HnswElement skipElement, HnswElement e)
 static bool
 ElementMatchesTidFilter(IndexScanDesc scan, HnswElement element)
 {
-#if PG_VERSION_NUM >= 180000 && PG_VERSION_NUM < 200000
+#if PG_VERSION_NUM >= 180000
 	if (!hnsw_in_traversal_filter || scan == NULL || scan->xs_tid_filter == NULL)
 		return true;
 
@@ -910,11 +858,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	HnswUnvisited *unvisited = palloc_array_checked(HnswUnvisited, lm);
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
-#if PG_VERSION_NUM >= 180000 && PG_VERSION_NUM < 200000
 	bool		filtering = hnsw_in_traversal_filter && filterScan != NULL && filterScan->xs_tid_filter != NULL && lc == 0 && !inserting;
-#else
-	bool		filtering = false;
-#endif
 
 	if (v == NULL)
 	{

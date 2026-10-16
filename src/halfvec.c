@@ -1,13 +1,11 @@
 #include "postgres.h"
 
 #include <math.h>
-#include <sys/time.h>
 
 #include "bitvec.h"
 #include "catalog/pg_type.h"
 #include "common/shortest_dec.h"
 #include "fmgr.h"
-#include "float_parse.h"
 #include "halfutils.h"
 #include "halfvec.h"
 #include "lib/stringinfo.h"
@@ -18,7 +16,6 @@
 #include "utils/float.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
-#include "utils/memutils.h"
 #include "utils/varbit.h"
 #include "vector.h"
 
@@ -184,14 +181,12 @@ FUNCTION_PREFIX PG_FUNCTION_INFO_V1(halfvec_in);
 Datum
 halfvec_in(PG_FUNCTION_ARGS)
 {
-	// struct timeval tv_s, tv_e;
-	// gettimeofday(&tv_s, NULL);
-
 	char	   *lit = PG_GETARG_CSTRING(0);
 	int32		typmod = PG_GETARG_INT32(2);
+	half		x[HALFVEC_MAX_DIM];
+	int			dim = 0;
 	char	   *pt = lit;
 	HalfVector *result;
-	int			dim;
 
 	while (halfvec_isspace(*pt))
 		pt++;
@@ -212,81 +207,62 @@ halfvec_in(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("halfvec must have at least 1 dimension")));
 
-	/* ================ Approach: heap pre-scan (no stack buffer) ================ */
+	for (;;)
 	{
-		/* Pre-scan dimension count */
-		dim = 1;
+		float		val;
+		char	   *stringEnd;
+
+		if (dim == HALFVEC_MAX_DIM)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("halfvec cannot have more than %d dimensions", HALFVEC_MAX_DIM)));
+
+		while (halfvec_isspace(*pt))
+			pt++;
+
+		/* Check for empty string like float4in */
+		if (*pt == '\0')
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid input syntax for type halfvec: \"%s\"", lit)));
+
+		errno = 0;
+
+		/* Postgres sets LC_NUMERIC to C on startup */
+		val = strtof(pt, &stringEnd);
+
+		if (stringEnd == pt)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid input syntax for type halfvec: \"%s\"", lit)));
+
+		x[dim] = Float4ToHalfUnchecked(val);
+
+		/* Check for range error like float4in */
+		if ((errno == ERANGE && isinf(val)) || (HalfIsInf(x[dim]) && !isinf(val)))
+			ereport(ERROR,
+					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+					 errmsg("\"%s\" is out of range for type halfvec", pnstrdup(pt, stringEnd - pt))));
+
+		CheckElement(x[dim]);
+		dim++;
+
+		pt = stringEnd;
+
+		while (halfvec_isspace(*pt))
+			pt++;
+
+		if (*pt == ',')
+			pt++;
+		else if (*pt == ']')
 		{
-			char	   *cnt = pt;
-
-			while (*cnt != ']')
-			{
-				if (*cnt == '\0')
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-							 errmsg("invalid input syntax for type halfvec: \"%s\"", lit)));
-				if (*cnt == ',')
-					dim++;
-				cnt++;
-			}
+			pt++;
+			break;
 		}
-
-		CheckDim(dim);
-		CheckExpectedDim(typmod, dim);
-		result = InitHalfVector(dim);
-
-		for (int i = 0; i < dim; i++)
-		{
-			float		val;
-			char	   *token_start;
-
-			while (halfvec_isspace(*pt))
-				pt++;
-
-			/* Check for empty string like float4in */
-			if (*pt == '\0')
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-						 errmsg("invalid input syntax for type halfvec: \"%s\"", lit)));
-
-			token_start = pt;
-
-			/* --- parse one value (mode selected by GUC) --- */
-			pt = float_parse_float(float_parse_mode, pt, &val, lit, "halfvec");
-
-			result->x[i] = Float4ToHalfUnchecked(val);
-
-			/* Half-specific overflow: finite float that exceeds half range */
-			if (HalfIsInf(result->x[i]) && !isinf(val))
-				ereport(ERROR,
-						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-						 errmsg("\"%s\" is out of range for type halfvec",
-								pnstrdup(token_start, pt - token_start))));
-
-			CheckElement(result->x[i]);
-
-			while (halfvec_isspace(*pt))
-				pt++;
-
-			if (i < dim - 1)
-			{
-				if (*pt == ',')
-					pt++;
-				else
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-							 errmsg("invalid input syntax for type halfvec: \"%s\"", lit)));
-			}
-			else
-			{
-				if (*pt == ']')
-					pt++;
-				else
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-							 errmsg("invalid input syntax for type halfvec: \"%s\"", lit)));
-			}
-		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid input syntax for type halfvec: \"%s\"", lit)));
 	}
 
 	/* Only whitespace is allowed after the closing brace */
@@ -299,11 +275,12 @@ halfvec_in(PG_FUNCTION_ARGS)
 				 errmsg("invalid input syntax for type halfvec: \"%s\"", lit),
 				 errdetail("Junk after closing right brace.")));
 
-	// gettimeofday(&tv_e, NULL);
-	// double total_ms = (tv_e.tv_sec - tv_s.tv_sec) * 1000.0 + (tv_e.tv_usec - tv_s.tv_usec) / 1000.0;
+	CheckDim(dim);
+	CheckExpectedDim(typmod, dim);
 
-	// elog(LOG, "[PGVECTOR_TIMING] halfvec_in mode=%s dim=%d len=%zu ms=%.4f ctx=%s",
-	// 	 float_parse_mode_str(float_parse_mode), dim, strlen(lit), total_ms, CurrentMemoryContext->name);
+	result = InitHalfVector(dim);
+	for (int i = 0; i < dim; i++)
+		result->x[i] = x[i];
 
 	PG_RETURN_POINTER(result);
 }
