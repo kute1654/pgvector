@@ -783,29 +783,6 @@ CountElement(HnswElement skipElement, HnswElement e)
 }
 
 /*
- * Check whether any heap TID for an element satisfies executor scalar quals.
- * Exploration still uses all elements; this only filters the result heap W.
- */
-static bool
-ElementMatchesTidFilter(IndexScanDesc scan, HnswElement element)
-{
-#if PG_VERSION_NUM >= 180000 && PG_VERSION_NUM < 200000
-	if (!hnsw_in_traversal_filter || scan == NULL || scan->xs_tid_filter == NULL)
-		return true;
-
-	for (int i = 0; i < element->heaptidsLength; i++)
-	{
-		if (scan->xs_tid_filter(scan, &element->heaptids[i], scan->xs_tid_filter_state))
-			return true;
-	}
-
-	return false;
-#else
-	return true;
-#endif
-}
-
-/*
  * Load unvisited neighbors from memory
  */
 static void
@@ -914,11 +891,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	HnswUnvisited *unvisited = palloc_array_checked(HnswUnvisited, lm);
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
-#if PG_VERSION_NUM >= 180000 && PG_VERSION_NUM < 200000
-	bool		filtering = hnsw_in_traversal_filter && filterScan != NULL && filterScan->xs_tid_filter != NULL && lc == 0 && !inserting;
-#else
-	bool		filtering = false;
-#endif
+	int64		visitedNodes = 0;
+	int64		distanceComputations = 0;
 
 	if (v == NULL)
 	{
@@ -983,6 +957,9 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize);
 		else
 			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
+
+		visitedNodes++;
+		distanceComputations += unvisitedLength;
 
 		/* OK to count elements instead of tuples */
 		if (tuples != NULL)
@@ -1065,6 +1042,11 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 		w = lappend(w, sc);
 	}
+
+	if (!inserting && lc == 0)
+		ereport(DEBUG1,
+				(errmsg("hnsw_search_layer_stats: lc=%d ef=%d visited_nodes=%lld distance_computations=%lld",
+						lc, ef, (long long) visitedNodes, (long long) distanceComputations)));
 
 	return w;
 }

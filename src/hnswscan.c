@@ -57,7 +57,7 @@ GetScanItems(IndexScanDesc scan, Datum value)
 
 	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v,
 							hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL,
-							true, &so->tuples, scan);
+							true, &so->tuples);
 }
 
 /*
@@ -256,7 +256,6 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		 */
 		if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_OFF &&
 			scan->numberOfOrderBys > 0 &&
-			!hnsw_in_traversal_filter &&
 			so->typeInfo->normalize == l2_normalize &&
 			!(scan->orderByData->sk_flags & SK_ISNULL))
 		{
